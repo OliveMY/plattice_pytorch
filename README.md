@@ -39,5 +39,3 @@ from plattice import PermutoLattice
 p = PermutoLattice()
 out = p(feature, values)
 ```
-
-### License
