@@ -1,7 +1,15 @@
-# Permutohedral Lattice — PyTorch version with CUDA
+# Permutohedral Lattice - PyTorch version with CUDA
 
-This is an **UNOFFICIAL GPU** implementation of the permutohedral lattice. The code is mainly a wrapper of original code released by the authors, with modifications to out-dated cuda function. For more information, please refer to the project page :
+This is an **UNOFFICIAL GPU** implementation of the permutohedral lattice. The code is based on the original CUDA reference released by the authors, with updates for modern PyTorch/CUDA and a full splat + blur + slice Gaussian/bilateral filter path. For more information, please refer to the project page:
 [Fast High-Dimensional Filtering Using the Permutohedral Lattice - Eurographics 2010 (stanford.edu)](https://graphics.stanford.edu/papers/permutohedral/).
+
+Current implementation notes:
+
+- CUDA extension for `float32` tensors shaped `[H, W, pd]` and `[H, W, vd]`.
+- Runtime-dispatched `pd` in `[1, 16]` and `vd` in `[1, 8]`.
+- Full permutohedral blur pass, not the approximate/no-blur path.
+- Backward computes gradients with respect to input values.
+- Optimized workspace allocation via PyTorch CUDA tensors, precomputed blur neighbors, and register slice accumulators.
 
 
 If you find the code useful, please cite
@@ -21,7 +29,7 @@ If you find the code useful, please cite
 
 ### Requirements
 
-PyTorch ≥ 1.8.0 (Not sure if it works on lower versions)
+PyTorch >= 1.8.0 (not tested on lower versions)
 
 ### Installation
 

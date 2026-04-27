@@ -1,910 +1,748 @@
-#define BLOCK_SIZE 64
-// #define _DEBUG
-#define WIN32 // delete this if you are using Linux
-#include <torch/extension.h>
+// Permutohedral lattice bilateral filter with runtime-dispatched pd/vd.
+//
+// Entrypoint:
+//   void permuto_filter(float* weight_out, float* out,
+//                       const float* values,   // [H, W, vd]
+//                       const float* features, // [H, W, pd]
+//                       void* matrix_storage,
+//                       float* h_values_dev, float* blur_values_dev,
+//                       int* h_entries_dev, signed short* h_keys_dev,
+//                       int* blur_neighbors_dev,
+//                       int pd, int vd, int w, int h);
+//
+// Out must be preallocated to [H, W, vd]. weight_out to [H, W, 1].
+// Out is overwritten with the filtered output. weight_out receives
+// the homogeneous normalizer (used by backward pass, unused here but
+// kept in the signature to match the torch wrapper).
+//
+// This is the full Gaussian/bilateral permutohedral filter: splat, blur,
+// then slice. The blur pass performs one [1, 2, 1] / 4 convolution along
+// each of the PD+1 lattice directions.
+//
+// Based on Adams/Baek/Davis 2010 ("Fast high-dimensional filtering using the
+// permutohedral lattice"), Stanford CUDA reference implementation.
+
 #include <cuda_runtime.h>
-#include <stdio.h>
+#include <cstdio>
+#include <cmath>
 
-#include "cuda_memory.h"
-#ifdef WIN32 
-#define no_init_all // avoid some compiling bug
-#endif
+#define BLOCK_SIZE 64   // 8x8 threads per block
+#define MAX_SUPPORTED_PD 16
+#define MAX_SUPPORTED_VD 8
 
-#include "MirroredArray.h"
-#include "hash_table.cu"
 
-  
-#ifdef LIBRARY
-extern "C"
-#ifdef WIN32
-__declspec(dllexport)
-#endif
-#endif
-// void initCuda(int argc, char **argv) {
-//     CUT_DEVICE_INIT(argc, argv);    
+// ---------- hash table ----------
 
-//     cudaDeviceProp prop;
-//     CUDA_SAFE_CALL_NO_SYNC(cudaGetDeviceProperties(&prop, 0));
-//     printf("Device name: %s\n", prop.name);
-//     printf("Max threads per block: %d\n", prop.maxThreadsPerBlock);
-//     printf("Max threads dim: %d %d %d\n", prop.maxThreadsDim[0], prop.maxThreadsDim[1], prop.maxThreadsDim[2]);
-//     printf("Max grid size: %d %d %d \n", prop.maxGridSize[0], prop.maxGridSize[1], prop.maxGridSize[2]);
-//     printf("Shared memory per block: %d Kb\n", (int)(prop.sharedMemPerBlock/1024));
-//     printf("Total global memory: %d Kb\n", (int)(prop.totalGlobalMem/1024));
-//     printf("Warp size: %d\n", prop.warpSize);
-//     printf("Memory pitch: %d\n", (int)prop.memPitch);
-//     printf("Registers per block: %d\n", prop.regsPerBlock);
-//     printf("Clock rate: %d\n", prop.clockRate);
-//     printf("Texture alignment: %d\n", (int)prop.textureAlignment);
-//     fflush(stdout);
-// }
+__device__ __constant__ float*        table_values;
+__device__ __constant__ signed short* table_keys;
+__device__ __constant__ int*          table_entries;
+__device__ __constant__ unsigned int  table_capacity;
+
+// constants for fast mod-by-constant (Granlund-Montgomery)
+__device__ __constant__ unsigned int __div_m;
+__device__ __constant__ unsigned int __div_l;
+__device__ __constant__ unsigned int __div_c;
+
+// Full-blur scale factors for runtime-dispatched PD and blurVariance=0.5:
+// (PD + 1) * sqrt(((1/6) + 0.5) / ((i + 1) * (i + 2))).
+__device__ __constant__ float scaleFactor_const[MAX_SUPPORTED_PD];
+
+// Hash offsets for lattice blur directions. Since permuto_hash is linear
+// modulo 2^32, hash(key +/- direction[color]) can be formed from hash(key)
+// +/- blurHashOffset_const[color].
+__device__ __constant__ unsigned int blurHashOffset_const[MAX_SUPPORTED_PD + 1];
+
+__device__ inline unsigned int modHash(unsigned int n) {
+    unsigned int t1 = __umulhi(__div_m, n);
+    return n - ((t1 + ((n - t1) >> 1)) >> (__div_l - 1)) * __div_c;
+}
+
+template<int PD>
+__device__ __host__ static inline unsigned int permuto_hash(const signed short* key) {
+    unsigned int k = 0;
+    #pragma unroll
+    for (int i = 0; i < PD; i++) {
+        k += key[i];
+        k = k * 2531011u;
+    }
+    return k;
+}
+
+template<int PD>
+__device__ static int hashTableInsert(const signed short* key, unsigned int slot) {
+    unsigned int fh = permuto_hash<PD>(key);
+    int h = modHash(fh);
+    while (1) {
+        int* e = &table_entries[h];
+        int contents = atomicCAS(e, -1, -2);
+        if (contents == -2) {
+            // locked by someone else, try next slot
+        } else if (contents == -1) {
+            // we locked an empty cell - write key
+            #pragma unroll
+            for (int i = 0; i < PD; i++) {
+                table_keys[slot * PD + i] = key[i];
+            }
+            atomicExch(e, slot);
+            return h;
+        } else {
+            // cell has a key - check match
+            bool match = true;
+            #pragma unroll
+            for (int i = 0; i < PD && match; i++) {
+                match = (table_keys[contents * PD + i] == key[i]);
+            }
+            if (match) return h;
+        }
+        h++;
+        if (h == (int)(table_capacity * 2)) h = 0;
+    }
+}
+
+template<int PD>
+__device__ static int hashTableRetrieve(const signed short* key) {
+    int h = modHash(permuto_hash<PD>(key));
+    while (1) {
+        int* e = table_entries + h;
+        if (*e == -1) return -1;
+        bool match = true;
+        #pragma unroll
+        for (int i = 0; i < PD && match; i++) {
+            match = (table_keys[(*e) * PD + i] == key[i]);
+        }
+        if (match) return *e;
+        h++;
+        if (h == (int)(table_capacity * 2)) h = 0;
+    }
+}
+
+template<int PD>
+__device__ static int hashTableRetrieveWithHash(unsigned int hash, const signed short* key) {
+    int h = modHash(hash);
+    while (1) {
+        int* e = table_entries + h;
+        if (*e == -1) return -1;
+        bool match = true;
+        #pragma unroll
+        for (int i = 0; i < PD && match; i++) {
+            match = (table_keys[(*e) * PD + i] == key[i]);
+        }
+        if (match) return *e;
+        h++;
+        if (h == (int)(table_capacity * 2)) h = 0;
+    }
+}
+
+
+// ---------- lattice stages ----------
 
 struct MatrixEntry {
-    int index;
+    int   index;
     float weight;
 };
 
-template<int pd>
-__global__ static void createMatrix(const int w, const int h, 
-				    const float *positions, 
-				    const float *values, 
-				    const float *scaleFactor,
-				    MatrixEntry *matrix) {
-
-    // scanline order
-    //const int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
-
-    // 8x8 blocks    
+template<int PD, int VD>
+__global__ static void createMatrix(const int w, const int h,
+                                    const float* positions,
+                                    MatrixEntry* matrix)
+{
     const int x = threadIdx.x + blockIdx.x * blockDim.x;
     const int y = threadIdx.y + blockIdx.y * blockDim.y;
-    const int threadId = threadIdx.y*blockDim.x + threadIdx.x;
-    const int idx = y*w + x;
+    const int threadId = threadIdx.y * blockDim.x + threadIdx.x;
+    const int idx = y * w + x;
     const bool outOfBounds = (x >= w) || (y >= h);
 
-    float myElevated[pd+1];
-    const float *myPosition = positions + idx*pd;
-
-    int myGreedy[pd+1];
-    int myRank[pd+1];
-
-    float myBarycentric[pd+2];
-    __shared__ short keys[pd*BLOCK_SIZE];
-    short *myKey = keys + threadId * pd;
+    float myElevated[PD + 1];
+    int   myGreedy[PD + 1];
+    int   myRank[PD + 1];
+    float myBarycentric[PD + 2];
+    __shared__ short keys[PD * BLOCK_SIZE];
+    short* myKey = keys + threadId * PD;
 
     if (!outOfBounds) {
+        const float* myPosition = positions + idx * PD;
 
-	myElevated[pd] = -pd*(myPosition[pd-1])*scaleFactor[pd-1];
-	for (int i = pd-1; i > 0; i--) {
-	    myElevated[i] = (myElevated[i+1] - 
-			     i*(myPosition[i-1])*scaleFactor[i-1] + 
-			     (i+2)*(myPosition[i])*scaleFactor[i]);
-	}
-	myElevated[0] = myElevated[1] + 2*(myPosition[0])*scaleFactor[0];
-	
-		
-	// find the closest zero-colored lattice point
+        // Elevate pd-dim feature to (pd+1)-dim on H_d
+        myElevated[PD] = -PD * myPosition[PD - 1] * scaleFactor_const[PD - 1];
+        #pragma unroll
+        for (int i = PD - 1; i > 0; i--) {
+            myElevated[i] = (myElevated[i + 1]
+                             - i * myPosition[i - 1] * scaleFactor_const[i - 1]
+                             + (i + 2) * myPosition[i] * scaleFactor_const[i]);
+        }
+        myElevated[0] = myElevated[1] + 2 * myPosition[0] * scaleFactor_const[0];
 
-	// greedily search for the closest zero-colored lattice point
-	signed short sum = 0;
-	for (int i = 0; i <= pd; i++) {
-	    float v = myElevated[i]*(1.0f/(pd+1));
-	    float up = ceilf(v) * (pd+1);
-	    float down = floorf(v) * (pd+1);
-	    if (up - myElevated[i] < myElevated[i] - down) {
-		myGreedy[i] = (signed short)up;
-	    } else {
-		myGreedy[i] = (signed short)down;
-	    }
-	    sum += myGreedy[i];
-	}
-	sum /= pd+1;
-	
-	// sort differential to find the permutation between this simplex and the canonical one
-	for (int i = 0; i <= pd; i++) {
-	    myRank[i] = 0;
-	    for (int j = 0; j <= pd; j++) {
-		if (myElevated[i] - myGreedy[i] < myElevated[j] - myGreedy[j] ||
-		    (myElevated[i] - myGreedy[i] == myElevated[j] - myGreedy[j]
-		     && i > j)) {
-		    myRank[i]++;
-		}
-	    }
-	}
-	
-	if (sum > 0) { // sum too large, need to bring down the ones with the smallest differential
-	    for (int i = 0; i <= pd; i++) {
-		if (myRank[i] >= pd + 1 - sum) {
-		    myGreedy[i] -= pd+1;
-		    myRank[i] += sum - (pd+1);
-		} else {
-		    myRank[i] += sum;
-		}
-	    }
-	} else if (sum < 0) { // sum too small, need to bring up the ones with largest differential
-	    for (int i = 0; i <= pd; i++) {
-		if (myRank[i] < -sum) {
-		    myGreedy[i] += pd+1;
-		    myRank[i] += (pd+1) + sum;
-		} else {
-		    myRank[i] += sum;
-		}
-	    }
-	}
+        // Find the zero-colored lattice point greedily
+        signed short sum = 0;
+        #pragma unroll
+        for (int i = 0; i <= PD; i++) {
+            float v = myElevated[i] * (1.0f / (PD + 1));
+            float up   = ceilf(v)  * (PD + 1);
+            float down = floorf(v) * (PD + 1);
+            myGreedy[i] = (up - myElevated[i] < myElevated[i] - down) ? (signed short)up
+                                                                      : (signed short)down;
+            sum += myGreedy[i];
+        }
+        sum /= PD + 1;
 
-        #ifdef LINEAR_D_MEMORY
-	for (int i = 0; i <= pd; i++) {
-	    table_zeros[idx*(pd+1)+i] = myGreedy[i];
-	    table_rank[idx*(pd+1)+i] = myRank[i];
-	}
-	#endif
+        // Permutation rank for the simplex
+        #pragma unroll
+        for (int i = 0; i <= PD; i++) {
+            myRank[i] = 0;
+            #pragma unroll
+            for (int j = 0; j <= PD; j++) {
+                float di = myElevated[i] - myGreedy[i];
+                float dj = myElevated[j] - myGreedy[j];
+                if (di < dj || (di == dj && i > j)) myRank[i]++;
+            }
+        }
 
-	// turn delta into barycentric coords
-	for (int i = 0; i <= pd+1; i++) {
-	    myBarycentric[i] = 0;
-	}
-	
-	for (int i = 0; i <= pd; i++) {
-	    float delta = (myElevated[i] - myGreedy[i]) * (1.0f/(pd+1));
-	    myBarycentric[pd-myRank[i]] += delta;
-	    myBarycentric[pd+1-myRank[i]] -= delta;
-	}
-	myBarycentric[0] += 1.0f + myBarycentric[pd+1];
+        // Fix up rank if sum drifted
+        if (sum > 0) {
+            #pragma unroll
+            for (int i = 0; i <= PD; i++) {
+                if (myRank[i] >= PD + 1 - sum) {
+                    myGreedy[i] -= PD + 1;
+                    myRank[i]   += sum - (PD + 1);
+                } else {
+                    myRank[i]   += sum;
+                }
+            }
+        } else if (sum < 0) {
+            #pragma unroll
+            for (int i = 0; i <= PD; i++) {
+                if (myRank[i] < -sum) {
+                    myGreedy[i] += PD + 1;
+                    myRank[i]   += (PD + 1) + sum;
+                } else {
+                    myRank[i]   += sum;
+                }
+            }
+        }
+
+        // Barycentric coordinates in the canonical simplex
+        #pragma unroll
+        for (int i = 0; i <= PD + 1; i++) myBarycentric[i] = 0.0f;
+
+        #pragma unroll
+        for (int i = 0; i <= PD; i++) {
+            float delta = (myElevated[i] - myGreedy[i]) * (1.0f / (PD + 1));
+            myBarycentric[PD     - myRank[i]] += delta;
+            myBarycentric[PD + 1 - myRank[i]] -= delta;
+        }
+        myBarycentric[0] += 1.0f + myBarycentric[PD + 1];
     }
 
-    #ifdef USE_ADDITIVE_HASH
-    unsigned int cumulative_hash = hash<pd>(myGreedy);
-    #endif
-    for (int color = 0; color <= pd; color++) {
-	// Compute the location of the lattice point explicitly (all but
-	// the last coordinate - it's redundant because they sum to zero)
-	if (!outOfBounds) {
-	    for (int i = 0; i < pd; i++) {
-		myKey[i] = myGreedy[i] + color;
-		if (myRank[i] > pd-color) myKey[i] -= (pd+1);
-	    }
-	}
-
-	#ifdef USE_ADDITIVE_HASH
-	for (int i = 0; i < pd; i++) {
-	    if (myRank[i] == pd-color) cumulative_hash += hOffset[i];
-	}
-	#endif
-	
-	if (!outOfBounds) {
-	    MatrixEntry r;
-	    #ifdef USE_ADDITIVE_HASH
-	    r.index = hashTableInsert<pd>(cumulative_hash, myKey, idx*(pd+1)+color);
-	    #else
-	    r.index = hashTableInsert<pd>(myKey, idx*(pd+1)+color);
-	    #endif
-	    r.weight = myBarycentric[color];
-	    matrix[idx*(pd+1) + color] = r;
-	}
-    }    
+    // Insert PD+1 lattice neighbors into the hash table
+    #pragma unroll
+    for (int color = 0; color <= PD; color++) {
+        if (!outOfBounds) {
+            #pragma unroll
+            for (int i = 0; i < PD; i++) {
+                myKey[i] = myGreedy[i] + color;
+                if (myRank[i] > PD - color) myKey[i] -= (PD + 1);
+            }
+            MatrixEntry r;
+            r.index  = hashTableInsert<PD>(myKey, idx * (PD + 1) + color);
+            r.weight = myBarycentric[color];
+            matrix[idx * (PD + 1) + color] = r;
+        }
+    }
 }
 
-template<int kd>
-__global__ static void cleanHashTable(int n, MatrixEntry *matrix) {
+template<int PD>
+__global__ static void cleanHashTable(int n, MatrixEntry* matrix) {
     const int idx = (blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x * blockDim.y + threadIdx.x;
-    
     if (idx >= n) return;
 
-    // find my hash table entry
-    int *e = table_entries + idx;
-
-    // Check if I created my own key in the previous phase
+    int* e = table_entries + idx;
     if (*e >= 0) {
-	// Rehash mykey and reset the pointer in order to merge with
-	// any other pixel that created a different entry under the
-	// same key. If the computation was serial this would never
-	// happen, but sometimes race conditions can make the same key
-	// be inserted twice. hashTableRetrieve always returns the
-	// earlier, so it's no  problem as long as we rehash now.
-
-        #ifdef LINEAR_D_MEMORY
-        // Get my key      
-        short myKey[kd];
-        generateKey<kd>(*e, myKey);
-	*e = hashTableRetrieve<kd>(myKey);
-        #else
-	*e = hashTableRetrieve<kd>(table_keys + *e*kd);
-	#endif
+        // Rehash so races between dup-key inserters converge.
+        *e = hashTableRetrieve<PD>(table_keys + (*e) * PD);
     }
-
 }
 
-
-template<int pd, int vd>
-__global__ static void splat(const int w, const int h, float *values, MatrixEntry *matrix) {
-    //const int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;    
-    
-    // 8x8 blocks    
+template<int PD, int VD>
+__global__ static void splatCache(const int w, const int h,
+                                  const float* values,
+                                  MatrixEntry* matrix)
+{
     const int x = threadIdx.x + blockIdx.x * blockDim.x;
-    const int y = threadIdx.y + (blockIdx.y/(pd+1)) * blockDim.y;
-    //const int threadId = threadIdx.y*blockDim.x + threadIdx.x;
-    const int color = blockIdx.y % (pd+1);
-    const int idx = y*w + x;
+    const int y = threadIdx.y + (blockIdx.y / (PD + 1)) * blockDim.y;
+    const int threadId = threadIdx.y * blockDim.x + threadIdx.x;
+    const int color = blockIdx.y % (PD + 1);
+    const int idx = y * w + x;
     const bool outOfBounds = (x >= w) || (y >= h);
-    
-    if (outOfBounds) return;
-    
-    float *myValue = values + idx*vd;
-    
-    MatrixEntry r = matrix[idx*(pd+1)+color];
-    matrix[idx*(pd+1)+color].index = r.index = table_entries[r.index];
-    float *val = table_values + r.index*(vd+1);
-    for (int j = 0; j < vd; j++) {
-	atomicAdd(val+j, myValue[j]*r.weight);
-    }
-    atomicAdd(val+vd, r.weight);
-}
 
-template<int pd, int vd>
-__global__ static void splatCache(const int w, const int h, float *values, MatrixEntry *matrix) {
+    __shared__ int   sharedOffsets[BLOCK_SIZE];
+    __shared__ float sharedValues[BLOCK_SIZE * (VD + 1)];
 
-    const int x = threadIdx.x + blockIdx.x * blockDim.x;
-    const int y = threadIdx.y + (blockIdx.y/(pd+1)) * blockDim.y;
-    const int threadId = threadIdx.y*blockDim.x + threadIdx.x;
-    const int color = blockIdx.y % (pd+1);
-    const int idx = y*w + x;
-    const bool outOfBounds = (x >= w) || (y >= h);
-    
-    __shared__ int sharedOffsets[BLOCK_SIZE];
-    __shared__ float sharedValues[BLOCK_SIZE*(vd+1)];
-    int myOffset = -1;
-    float *myValue = sharedValues + threadId*(vd+1);
-    
+    int   myOffset = -1;
+    float* myValue = sharedValues + threadId * (VD + 1);
+
     if (!outOfBounds) {
-	
-	float *value = values + idx*vd;
-	
-	MatrixEntry r = matrix[idx*(pd+1)+color];
-	
-	// convert the matrix entry from a pointer into the entries array to a pointer into the keys/values array
-	matrix[idx*(pd+1)+color].index = r.index = table_entries[r.index];
-	// record the offset into the keys/values array in shared space
-	myOffset = sharedOffsets[threadId] = r.index*(vd+1);
-	
-	for (int j = 0; j < vd; j++) {
-	    myValue[j] = value[j]*r.weight;
-	}
-	myValue[vd] = r.weight;
-	
+        const float* value = values + idx * VD;
+
+        MatrixEntry r = matrix[idx * (PD + 1) + color];
+        // convert hash-table entry index into keys/values-array index
+        matrix[idx * (PD + 1) + color].index = r.index = table_entries[r.index];
+        myOffset = sharedOffsets[threadId] = r.index * (VD + 1);
+
+        #pragma unroll
+        for (int j = 0; j < VD; j++) myValue[j] = value[j] * r.weight;
+        myValue[VD] = r.weight;
     } else {
-	sharedOffsets[threadId] = -1;
+        sharedOffsets[threadId] = -1;
     }
-    
+
     __syncthreads();
-    
-    // am I the first thread in this block to care about this key?
-    
+
     if (outOfBounds) return;
-    
-    for (int i = 0; i < BLOCK_SIZE; i++) { 
-	if (i < threadId) {
-	    if (myOffset == sharedOffsets[i]) {
-		// somebody else with higher priority cares about this key
-		return;
-	    }
-	} else if (i > threadId) {
-	    if (myOffset == sharedOffsets[i]) {
-		// someone else with lower priority cares about this key, accumulate it into mine
-		for (int j = 0; j <= vd; j++) {
-		    sharedValues[threadId*(vd+1) + j] += sharedValues[i*(vd+1) + j];
-		}
-	    }
-	}
+
+    // Intra-block dedup: threads with the same offset merge into the lowest id.
+    for (int i = 0; i < BLOCK_SIZE; i++) {
+        if (i < threadId) {
+            if (myOffset == sharedOffsets[i]) return;   // someone earlier owns this key
+        } else if (i > threadId) {
+            if (myOffset == sharedOffsets[i]) {
+                #pragma unroll
+                for (int j = 0; j <= VD; j++) {
+                    sharedValues[threadId * (VD + 1) + j] += sharedValues[i * (VD + 1) + j];
+                }
+            }
+        }
     }
-    
-    // only the threads with something to write to main memory are still going
-    float *val = table_values + myOffset;
-    for (int j = 0; j <= vd; j++) {
-	atomicAdd(val+j, myValue[j]);
-    }
+
+    float* val = table_values + myOffset;
+    #pragma unroll
+    for (int j = 0; j <= VD; j++) atomicAdd(val + j, myValue[j]);
 }
 
-template<int pd, int vd>
-__global__ static void g_splatCache(const int w, const int h, float *values, MatrixEntry *matrix, float * weight_in) {
-
-    const int x = threadIdx.x + blockIdx.x * blockDim.x;
-    const int y = threadIdx.y + (blockIdx.y/(pd+1)) * blockDim.y;
-    const int threadId = threadIdx.y*blockDim.x + threadIdx.x;
-    const int color = blockIdx.y % (pd+1);
-    const int idx = y*w + x;
-    const bool outOfBounds = (x >= w) || (y >= h);
-    
-    __shared__ int sharedOffsets[BLOCK_SIZE];
-    __shared__ float sharedValues[BLOCK_SIZE*(vd+1)];
-    int myOffset = -1;
-    float *myValue = sharedValues + threadId*(vd+1);
-    
-    if (!outOfBounds) {
-	
-	float *value = values + idx*vd;
-
-    //multiply the weights
-    float thisWeight = weight_in[idx];
-    for(int kk =0; kk<vd;kk++) value[kk] = value[kk] * thisWeight;
-
-	
-	MatrixEntry r = matrix[idx*(pd+1)+color];
-	
-	// convert the matrix entry from a pointer into the entries array to a pointer into the keys/values array
-	matrix[idx*(pd+1)+color].index = r.index = table_entries[r.index];
-	// record the offset into the keys/values array in shared space
-	myOffset = sharedOffsets[threadId] = r.index*(vd+1);
-	
-	for (int j = 0; j < vd; j++) {
-	    myValue[j] = value[j]*r.weight;
-	}
-	myValue[vd] = r.weight;
-	
-    } else {
-	sharedOffsets[threadId] = -1;
-    }
-    
-    __syncthreads();
-    
-    // am I the first thread in this block to care about this key?
-    
-    if (outOfBounds) return;
-    
-    for (int i = 0; i < BLOCK_SIZE; i++) { 
-	if (i < threadId) {
-	    if (myOffset == sharedOffsets[i]) {
-		// somebody else with higher priority cares about this key
-		return;
-	    }
-	} else if (i > threadId) {
-	    if (myOffset == sharedOffsets[i]) {
-		// someone else with lower priority cares about this key, accumulate it into mine
-		for (int j = 0; j <= vd; j++) {
-		    sharedValues[threadId*(vd+1) + j] += sharedValues[i*(vd+1) + j];
-		}
-	    }
-	}
-    }
-    
-    // only the threads with something to write to main memory are still going
-    float *val = table_values + myOffset;
-    for (int j = 0; j <= vd; j++) {
-	atomicAdd(val+j, myValue[j]);
-    }
-}
-
-
-template<int pd, int vd>
-__global__ static void blur(int n, float *newValues, MatrixEntry *matrix, int color) {
+template<int PD, int VD>
+__global__ static void blur(const int n_vertices,
+                            float* new_values,
+                            MatrixEntry* matrix,
+                            int* blur_neighbors,
+                            const int color)
+{
     const int idx = (blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x * blockDim.y + threadIdx.x;
+    if (idx >= n_vertices) return;
 
-    if (idx >= n) return;
-
-    // Check if I'm valid
+    // Only canonical lattice vertices own storage in table_values.
     if (matrix[idx].index != idx) return;
 
+    const int neighborBase = (idx * (PD + 1) + color) * 2;
+    const int offNp = blur_neighbors[neighborBase];
+    const int offNm = blur_neighbors[neighborBase + 1];
 
-    // find my key and the keys of my neighbours
-    short myKey[pd+1];
-    short np[pd+1];
-    short nm[pd+1];
+    const float* valMe = table_values + (VD + 1) * idx;
+    float* valOut = new_values + (VD + 1) * idx;
 
-    #ifdef LINEAR_D_MEMORY
-    generateKey<pd>(idx, myKey);
-    for (int i = 0; i < pd; i++) {
-	np[i] = myKey[i]+1;    
-	nm[i] = myKey[i]-1;
+    #pragma unroll
+    for (int i = 0; i <= VD; i++) {
+        float accum = 2.0f * valMe[i];
+        if (offNp >= 0) accum += table_values[(VD + 1) * offNp + i];
+        if (offNm >= 0) accum += table_values[(VD + 1) * offNm + i];
+        valOut[i] = 0.25f * accum;
     }
-    #else
-    for (int i = 0; i < pd; i++) {
-        myKey[i] = table_keys[idx*pd+i];
-	np[i] = myKey[i]+1;    
-	nm[i] = myKey[i]-1;
+}
+
+template<int PD>
+__global__ static void precomputeBlurNeighbors(const int n_vertices,
+                                               MatrixEntry* matrix,
+                                               int* blur_neighbors)
+{
+    const int idx = (blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x * blockDim.y + threadIdx.x;
+    if (idx >= n_vertices) return;
+    if (matrix[idx].index != idx) return;
+
+    signed short myKey[PD];
+    #pragma unroll
+    for (int i = 0; i < PD; i++) myKey[i] = table_keys[idx * PD + i];
+
+    const unsigned int myHash = permuto_hash<PD>(myKey);
+    for (int color = 0; color <= PD; color++) {
+        signed short np[PD];
+        signed short nm[PD];
+        #pragma unroll
+        for (int i = 0; i < PD; i++) {
+            np[i] = myKey[i] + 1;
+            nm[i] = myKey[i] - 1;
+        }
+        if (color < PD) {
+            np[color] -= PD + 1;
+            nm[color] += PD + 1;
+        }
+        const int neighborBase = (idx * (PD + 1) + color) * 2;
+        blur_neighbors[neighborBase] =
+            hashTableRetrieveWithHash<PD>(myHash + blurHashOffset_const[color], np);
+        blur_neighbors[neighborBase + 1] =
+            hashTableRetrieveWithHash<PD>(myHash - blurHashOffset_const[color], nm);
     }
-    #endif
+}
 
-    np[color] -= pd+1;
-    nm[color] += pd+1;
+template<int PD, int VD>
+__global__ static void slice(const int w, const int h,
+                             float* values,
+                             MatrixEntry* matrix,
+                             float* weight_out)
+{
+    const int x = threadIdx.x + blockIdx.x * blockDim.x;
+    const int y = threadIdx.y + blockIdx.y * blockDim.y;
+    const int idx = y * w + x;
+    if (x >= w || y >= h) return;
 
-#ifdef USE_ADDITIVE_HASH
-    unsigned int hCurrent = hash<pd>(myKey);
-    int offNp = hashTableRetrieveWithHash<pd>(hCurrent+hOffset[color],np);
-    int offNm = hashTableRetrieveWithHash<pd>(hCurrent-hOffset[color],nm);
-#else
-    int offNp = hashTableRetrieve<pd>(np);
-    int offNm = hashTableRetrieve<pd>(nm);
-#endif
+    float myValue[VD];
 
-    float *valMe = table_values + (vd+1)*idx;
-    float *valNp = table_values + (vd+1)*offNp;
-    float *valNm = table_values + (vd+1)*offNm;	
-    float *valOut = newValues + (vd+1)*idx;
+    #pragma unroll
+    for (int i = 0; i < VD; i++) myValue[i] = 0.0f;
+    float myWeight = 0.0f;
 
-    if (offNp >= 0 && offNm >= 0) {
-	for (int i = 0; i <= vd; i++) {
-	    valOut[i] = (valNp[i] + (valMe[i]*2) + valNm[i])/4;
-	}
-    } else if (offNp >= 0) {
-	for (int i = 0; i <= vd; i++) {
-	    valOut[i] = (valNp[i] + (valMe[i]*2))/4;
-	}
-    } else if (offNm >= 0) {
-	for (int i = 0; i <= vd; i++) {
-	    valOut[i] = (valNm[i] + (valMe[i]*2))/4;
-	}
+    #pragma unroll
+    for (int i = 0; i <= PD; i++) {
+        MatrixEntry r = matrix[idx * (PD + 1) + i];
+        const float* val = table_values + r.index * (VD + 1);
+        #pragma unroll
+        for (int j = 0; j < VD; j++) myValue[j] += r.weight * val[j];
+        myWeight += r.weight * val[VD];
+    }
+
+    myWeight = 1.0f / myWeight;
+    #pragma unroll
+    for (int j = 0; j < VD; j++) values[idx * VD + j] = myValue[j] * myWeight;
+    weight_out[idx] = myWeight;
+}
+
+template<int PD, int VD>
+__global__ static void g_splatCache(const int w, const int h,
+                                    const float* values,
+                                    MatrixEntry* matrix,
+                                    const float* weight_in)
+{
+    const int x = threadIdx.x + blockIdx.x * blockDim.x;
+    const int y = threadIdx.y + (blockIdx.y / (PD + 1)) * blockDim.y;
+    const int threadId = threadIdx.y * blockDim.x + threadIdx.x;
+    const int color = blockIdx.y % (PD + 1);
+    const int idx = y * w + x;
+    const bool outOfBounds = (x >= w) || (y >= h);
+
+    __shared__ int   sharedOffsets[BLOCK_SIZE];
+    __shared__ float sharedValues[BLOCK_SIZE * (VD + 1)];
+
+    int myOffset = -1;
+    float* myValue = sharedValues + threadId * (VD + 1);
+
+    if (!outOfBounds) {
+        const float* value = values + idx * VD;
+        const float thisWeight = weight_in[idx];
+
+        MatrixEntry r = matrix[idx * (PD + 1) + color];
+        matrix[idx * (PD + 1) + color].index = r.index = table_entries[r.index];
+        myOffset = sharedOffsets[threadId] = r.index * (VD + 1);
+
+        #pragma unroll
+        for (int j = 0; j < VD; j++) myValue[j] = value[j] * thisWeight * r.weight;
+        myValue[VD] = r.weight;
     } else {
-	for (int i = 0; i <= vd; i++) {
-	    valOut[i] = valMe[i]/2;	    
-	}
+        sharedOffsets[threadId] = -1;
     }
-    
-}
 
-template<int pd, int vd>
-__global__ static void slice(const int w, const int h, float *values, MatrixEntry *matrix, float * weight) {
-    //const int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;    
-
-    const int x = threadIdx.x + blockIdx.x * blockDim.x;
-    const int y = threadIdx.y + blockIdx.y * blockDim.y;
-    const int threadId = threadIdx.y*blockDim.x + threadIdx.x;
-    const int idx = y*w + x;
-    const bool outOfBounds = (x >= w) || (y >= h);
+    __syncthreads();
 
     if (outOfBounds) return;
 
-    __shared__ float localValue[BLOCK_SIZE*vd];
-
-    float *myValue = localValue + threadId*vd;
-    float myWeight = 0;
-
-    for (int i = 0; i < vd; i++) {
-	myValue[i] = 0;
+    for (int i = 0; i < BLOCK_SIZE; i++) {
+        if (i < threadId) {
+            if (myOffset == sharedOffsets[i]) return;
+        } else if (i > threadId) {
+            if (myOffset == sharedOffsets[i]) {
+                #pragma unroll
+                for (int j = 0; j <= VD; j++) {
+                    sharedValues[threadId * (VD + 1) + j] += sharedValues[i * (VD + 1) + j];
+                }
+            }
+        }
     }
 
-    for (int i = 0; i <= pd; i++) {
-	MatrixEntry r = matrix[idx*(pd+1) + i];
-	float *val = table_values + r.index*(vd+1);
-	for (int j = 0; j < vd; j++) {
-	    myValue[j] += r.weight*val[j];
-	}
-	myWeight += r.weight*val[vd];
-    }
-
-    myWeight = 1.0f/myWeight;
-    for (int j = 0; j < vd; j++) 
-	values[idx*vd + j] = myValue[j]*myWeight;
-    weight[idx] = myWeight;
+    float* val = table_values + myOffset;
+    #pragma unroll
+    for (int j = 0; j <= VD; j++) atomicAdd(val + j, myValue[j]);
 }
 
-
-template<int pd, int vd>
-__global__ static void g_slice(const int w, const int h, float *values, MatrixEntry *matrix) {
-    //const int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;    
-
+template<int PD, int VD>
+__global__ static void g_slice(const int w, const int h,
+                               float* values,
+                               MatrixEntry* matrix)
+{
     const int x = threadIdx.x + blockIdx.x * blockDim.x;
     const int y = threadIdx.y + blockIdx.y * blockDim.y;
-    const int threadId = threadIdx.y*blockDim.x + threadIdx.x;
-    const int idx = y*w + x;
-    const bool outOfBounds = (x >= w) || (y >= h);
+    const int idx = y * w + x;
+    if (x >= w || y >= h) return;
 
-    if (outOfBounds) return;
+    float myValue[VD];
 
-    __shared__ float localValue[BLOCK_SIZE*vd];
+    #pragma unroll
+    for (int i = 0; i < VD; i++) myValue[i] = 0.0f;
 
-    float *myValue = localValue + threadId*vd;
-    // float myWeight = 0;
-
-    for (int i = 0; i < vd; i++) {
-	myValue[i] = 0;
+    #pragma unroll
+    for (int i = 0; i <= PD; i++) {
+        MatrixEntry r = matrix[idx * (PD + 1) + i];
+        const float* val = table_values + r.index * (VD + 1);
+        #pragma unroll
+        for (int j = 0; j < VD; j++) myValue[j] += r.weight * val[j];
     }
 
-    for (int i = 0; i <= pd; i++) {
-	MatrixEntry r = matrix[idx*(pd+1) + i];
-	float *val = table_values + r.index*(vd+1);
-	for (int j = 0; j < vd; j++) {
-	    myValue[j] += r.weight*val[j];
-	}
-	// myWeight += r.weight*val[vd];
-    }
-
-    // myWeight = 1.0f/myWeight;
-    for (int j = 0; j < vd; j++) 
-	values[idx*vd + j] = myValue[j];
+    #pragma unroll
+    for (int j = 0; j < VD; j++) values[idx * VD + j] = myValue[j];
 }
- 
 
-template<int vd, int pd>
-void filter_(float * weight_out, float * out, float *im, float *ref, int w, int h, bool accurate) {    
-    int n = w*h;
-    float blurVariance = accurate ? 0.5 : 0;
 
-    MirroredArray<float> scaleFactor(pd);
-    //MirroredArray<float> offset(pd);
-    for (int i = 0; i < pd; i++) {
-	scaleFactor.host[i] = (pd+1)*sqrtf((1.0/6 + blurVariance)/((i+1)*(i+2)));
-	//offset.host[i] = ((double)rand()/RAND_MAX)*(pd+1)*2;
+// ---------- host entrypoint ----------
+
+template<int PD>
+static void setup_lattice_constants(int capacity)
+{
+    float scaleFactor_host[PD];
+    unsigned int blurHashOffset_host[PD + 1];
+    for (int i = 0; i < PD; i++) {
+        scaleFactor_host[i] = (PD + 1) * sqrtf(((1.0f / 6.0f) + 0.5f) / ((i + 1) * (i + 2)));
+
+        signed short offset[PD];
+        for (int j = 0; j < PD; j++) offset[j] = 1;
+        offset[i] -= PD + 1;
+        blurHashOffset_host[i] = permuto_hash<PD>(offset);
     }
-    scaleFactor.hostToDevice();
-    //offset.hostToDevice();
+    signed short lastOffset[PD];
+    for (int j = 0; j < PD; j++) lastOffset[j] = 1;
+    blurHashOffset_host[PD] = permuto_hash<PD>(lastOffset);
 
-    // MirroredArrayDevice<float> values(im, n*vd);
-    float * values = out;
-    MirroredArrayDevice<float> positions(ref, n*pd);
-    MirroredArray<MatrixEntry> matrix(n*(pd+1));
-    createHashTable<pd, vd+1>(n*(pd+1));
+    cudaMemcpyToSymbol(scaleFactor_const, scaleFactor_host, PD * sizeof(float));
+    cudaMemcpyToSymbol(blurHashOffset_const, blurHashOffset_host, (PD + 1) * sizeof(unsigned int));
 
-    // Populate constant memory for hash helpers
-    unsigned long long int __host_two32 = ((unsigned long long int)1)<<32;
-    unsigned int __host_div_c = 2*(n*(pd+1));
-    unsigned int __host_div_l = ceilf(logf((float)__host_div_c) / logf(2.0f));
-    unsigned int __host_div_m = (__host_two32<<__host_div_l)/__host_div_c - __host_two32 + 1;
-    auto err = cudaMemcpyToSymbol(__div_c, &__host_div_c, sizeof(unsigned int));
-    if(err != cudaSuccess) printf("Copy Err %s", cudaGetErrorString(err));
-    cudaMemcpyToSymbol(__div_l, &__host_div_l, sizeof(unsigned int));
-    cudaMemcpyToSymbol(__div_m, &__host_div_m, sizeof(unsigned int));
+    unsigned long long two32 = ((unsigned long long)1) << 32;
+    unsigned int div_c = 2u * capacity;
+    unsigned int div_l = (unsigned int)ceilf(logf((float)div_c) / logf(2.0f));
+    unsigned int div_m = (unsigned int)((two32 << div_l) / div_c - two32 + 1);
+    cudaMemcpyToSymbol(__div_c, &div_c, sizeof(unsigned int));
+    cudaMemcpyToSymbol(__div_l, &div_l, sizeof(unsigned int));
+    cudaMemcpyToSymbol(__div_m, &div_m, sizeof(unsigned int));
+}
 
-    // Populate constant memory with hash of offset vectors
-    unsigned int hOffset_host[pd+1];
-    signed short offset[pd+1];
-    for (int i = 0; i < pd; offset[i] = 1, i++);
-    for (int i = 0; i <= pd; i++) {
-      offset[i] -= pd+1; hOffset_host[i] = hash<pd>(offset); offset[i] += pd+1;
-    }
-    cudaMemcpyToSymbol((char*)&hOffset, &hOffset_host, sizeof(unsigned int)*(pd+1));
+template<int PD, int VD>
+static void permuto_filter_impl(float* weight_out, float* out,
+                                const float* values,
+                                const float* features,
+                                void* matrix_storage,
+                                float* h_values_dev,
+                                float* blur_values_dev,
+                                int* h_entries_dev,
+                                signed short* h_keys_dev,
+                                int* blur_neighbors_dev,
+                                int w, int h)
+{
+    const int n = w * h;
 
-    //  cudaGetLastError();
-    
+    MatrixEntry* matrix_dev = reinterpret_cast<MatrixEntry*>(matrix_storage);
 
-    dim3 blocks((w-1)/8+1, (h-1)/8+1, 1);
+    // Hash table: 2n(pd+1) entries, load factor 0.5.
+    const int capacity = n * (PD + 1);
+    cudaMemset(h_values_dev, 0, capacity * (VD + 1) * sizeof(float));
+    cudaMemset(h_entries_dev, -1, capacity * 2 * sizeof(int));
+    cudaMemset(h_keys_dev, 0, capacity * PD * sizeof(signed short));
+
+    unsigned int cap_u = (unsigned int)capacity;
+    cudaMemcpyToSymbol(table_capacity, &cap_u, sizeof(unsigned int));
+    cudaMemcpyToSymbol(table_values,   &h_values_dev,  sizeof(float*));
+    cudaMemcpyToSymbol(table_entries,  &h_entries_dev, sizeof(int*));
+    cudaMemcpyToSymbol(table_keys,     &h_keys_dev,    sizeof(signed short*));
+
+    setup_lattice_constants<PD>(capacity);
+
+    dim3 blocks((w - 1) / 8 + 1, (h - 1) / 8 + 1, 1);
     dim3 blockSize(8, 8, 1);
 
-    // timeval t[7];
+    // 1. Build the matrix
+    createMatrix<PD, VD><<<blocks, blockSize>>>(w, h, features, matrix_dev);
 
-    // gettimeofday(t+0, NULL);    
-
-    createMatrix<pd><<<blocks, blockSize>>>(w, h, positions.device, 
-					    values, 
-					    scaleFactor.device,
-					    matrix.device);
-
-
-    // gettimeofday(t+1, NULL);    
-
-    //HashTable hostTable;
-    //int hashTableEntries;
-    //CUDA_SAFE_CALL(cudaMemcpy(&hostTable, table, sizeof(HashTable), cudaMemcpyDeviceToHost));
-    //CUDA_SAFE_CALL(cudaMemcpy(&hashTableEntries, hostTable_filled, sizeof(int), cudaMemcpyDeviceToHost));
-    //printf("Hash table has %d entries\n", hashTableEntries);   
-
-    // fix duplicate hash table entries
+    // 2. Clean duplicate hash entries
     int cleanBlockSize = 32;
-    dim3 cleanBlocks((n-1)/cleanBlockSize+1, 2*(pd+1), 1);
-    cleanHashTable<pd><<<cleanBlocks, cleanBlockSize>>>(2*n*(pd+1), matrix.device);
+    dim3 cleanBlocks((n - 1) / cleanBlockSize + 1, 2 * (PD + 1), 1);
+    cleanHashTable<PD><<<cleanBlocks, cleanBlockSize>>>(2 * n * (PD + 1), matrix_dev);
 
-    // gettimeofday(t+2, NULL);    
+    // 3. Splat: accumulate values onto lattice vertices
+    dim3 splatBlocks = blocks;
+    splatBlocks.y *= (PD + 1);
+    splatCache<PD, VD><<<splatBlocks, blockSize>>>(w, h, values, matrix_dev);
 
-    // splat splits by color, so extend the y coordinate to our blocks to represent that
-    blocks.y *= pd+1;
-    splatCache<pd, vd><<<blocks, blockSize>>>(w, h, values, matrix.device);
-    //splat<pd, vd><<<blocks, blockSize>>>(w, h, values.device, matrix.device);
+    // 4. Resolve blur neighbor indices once; blur passes then avoid hash probes.
+    const int n_vertices = n * (PD + 1);
+    precomputeBlurNeighbors<PD><<<cleanBlocks, cleanBlockSize>>>(
+        n_vertices, matrix_dev, blur_neighbors_dev);
 
-    // gettimeofday(t+3, NULL);    
-
-    
-    if (accurate) {
-	float *newValues;
-	allocateCudaMemory((void**)&(newValues), n*(pd+1)*(vd+1)*sizeof(float));
-	cudaMemset((void *)newValues, 0, n*(pd+1)*(vd+1)*sizeof(float));
-	
-	for (int color = 0; color <= pd; color++) {	
-	    blur<pd, vd><<<cleanBlocks, cleanBlockSize>>>(n*(pd+1), newValues, matrix.device, color);
-	    // CUT_CHECK_ERROR("blur failed\n");
-	    newValues = swapHashTableValues(newValues);
-	}
+    // 5. Blur: convolve lattice values along each permutohedral direction.
+    float* current_values_dev = h_values_dev;
+    float* next_values_dev = blur_values_dev;
+    for (int color = 0; color <= PD; color++) {
+        blur<PD, VD><<<cleanBlocks, cleanBlockSize>>>(
+            n_vertices, next_values_dev, matrix_dev, blur_neighbors_dev, color);
+        cudaMemcpyToSymbol(table_values, &next_values_dev, sizeof(float*));
+        float* previous_values_dev = current_values_dev;
+        current_values_dev = next_values_dev;
+        next_values_dev = previous_values_dev;
     }
-    
 
-    // gettimeofday(t+4, NULL);    
-    
-    blocks.y /= (pd+1);
-    slice<pd, vd><<<blocks, blockSize>>>(w, h, values, matrix.device, weight_out);
-	
-
-    // gettimeofday(t+5, NULL);    
-
-    // double total = (t[5].tv_sec - t[0].tv_sec)*1000.0 + (t[5].tv_usec - t[0].tv_usec)/1000.0;
-    // printf("Total time: %3.3f ms\n", total);
-
-    // char *names[5] = {"Create",
-	// 	      "Clean ",
-	// 	      "Splat ",
-	// 	      "Blur  ",
-	// 	      "Slice "};
-
-    // for (int i = 1; i < 6; i++) {
-	// printf("%s: %3.3f ms\n", names[i-1], (t[i].tv_sec - t[i-1].tv_sec)*1000.0 + (t[i].tv_usec - t[i-1].tv_usec)/1000.0);
-    // }
-    // printf("Total GPU memory usage: %u bytes\n", (unsigned int)GPU_MEMORY_ALLOCATION);
-    // auto err = cudaMemcpy(out, values.device, n*vd*sizeof(float), cudaMemcpyDeviceToDevice);
-    // if(err != cudaSuccess) printf("Copy Err %s", cudaGetErrorString(err));
-    destroyHashTable();
+    // 6. Slice: interpolate filtered values back to pixel grid.
+    slice<PD, VD><<<blocks, blockSize>>>(w, h, out, matrix_dev, weight_out);
 }
 
+template<int PD, int VD>
+static void permuto_filter_grad_impl(float* out,
+                                     const float* grad_values,
+                                     const float* weight_in,
+                                     const float* features,
+                                     void* matrix_storage,
+                                     float* h_values_dev,
+                                     float* blur_values_dev,
+                                     int* h_entries_dev,
+                                     signed short* h_keys_dev,
+                                     int* blur_neighbors_dev,
+                                     int w, int h)
+{
+    const int n = w * h;
 
+    MatrixEntry* matrix_dev = reinterpret_cast<MatrixEntry*>(matrix_storage);
 
-#ifdef LIBRARY
-extern "C"
-#ifdef WIN32
-__declspec(dllexport)
-#endif
-#endif
-void filter(float * weight_out, float * out, float *im, float *ref, int pd, int vd, int w, int h, bool accurate) {
-    switch (vd*1000 + pd) {
-    case 1001: filter_<1, 1>(weight_out, out, im, ref, w, h, accurate); break;
-    case 2001: filter_<2, 1>(weight_out, out, im, ref, w, h, accurate); break;
-    case 3001: filter_<3, 1>(weight_out, out, im, ref, w, h, accurate); break;
-    case 1002: filter_<1, 2>(weight_out, out, im, ref, w, h, accurate); break;
-    case 2002: filter_<2, 2>(weight_out, out, im, ref, w, h, accurate); break;
-    case 3002: filter_<3, 2>(weight_out, out, im, ref, w, h, accurate); break;
-    case 1003: filter_<1, 3>(weight_out, out, im, ref, w, h, accurate); break;
-    case 2003: filter_<2, 3>(weight_out, out, im, ref, w, h, accurate); break;
-    case 3003: filter_<3, 3>(weight_out, out, im, ref, w, h, accurate); break;
-    case 1004: filter_<1, 4>(weight_out, out, im, ref, w, h, accurate); break;
-    case 2004: filter_<2, 4>(weight_out, out, im, ref, w, h, accurate); break;
-    case 3004: filter_<3, 4>(weight_out, out, im, ref, w, h, accurate); break;
-    case 1005: filter_<1, 5>(weight_out, out, im, ref, w, h, accurate); break;
-    case 2005: filter_<2, 5>(weight_out, out, im, ref, w, h, accurate); break;
-    case 3005: filter_<3, 5>(weight_out, out, im, ref, w, h, accurate); break;
-    case 1006: filter_<1, 6>(weight_out, out, im, ref, w, h, accurate); break;
-    case 2006: filter_<2, 6>(weight_out, out, im, ref, w, h, accurate); break;
-    case 3006: filter_<3, 6>(weight_out, out, im, ref, w, h, accurate); break;
-    case 1007: filter_<1, 7>(weight_out, out, im, ref, w, h, accurate); break;
-    case 2007: filter_<2, 7>(weight_out, out, im, ref, w, h, accurate); break;
-    case 3007: filter_<3, 7>(weight_out, out, im, ref, w, h, accurate); break;
-    case 1008: filter_<1, 8>(weight_out, out, im, ref, w, h, accurate); break;
-    case 2008: filter_<2, 8>(weight_out, out, im, ref, w, h, accurate); break;
-    case 3008: filter_<3, 8>(weight_out, out, im, ref, w, h, accurate); break;
-    case 1009: filter_<1, 9>(weight_out, out, im, ref, w, h, accurate); break;
-    case 2009: filter_<2, 9>(weight_out, out, im, ref, w, h, accurate); break;
-    case 3009: filter_<3, 9>(weight_out, out, im, ref, w, h, accurate); break;
-    case 1010: filter_<1, 10>(weight_out, out, im, ref, w, h, accurate); break;
-    case 2010: filter_<2, 10>(weight_out, out, im, ref, w, h, accurate); break;
-    case 3010: filter_<3, 10>(weight_out, out, im, ref, w, h, accurate); break;
-    case 1011: filter_<1, 11>(weight_out, out, im, ref, w, h, accurate); break;
-    case 2011: filter_<2, 11>(weight_out, out, im, ref, w, h, accurate); break;
-    case 3011: filter_<3, 11>(weight_out, out, im, ref, w, h, accurate); break;
-    case 1012: filter_<1, 12>(weight_out, out, im, ref, w, h, accurate); break;
-    case 2012: filter_<2, 12>(weight_out, out, im, ref, w, h, accurate); break;
-    case 3012: filter_<3, 12>(weight_out, out, im, ref, w, h, accurate); break;
-    case 1013: filter_<1, 13>(weight_out, out, im, ref, w, h, accurate); break;
-    case 2013: filter_<2, 13>(weight_out, out, im, ref, w, h, accurate); break;
-    case 3013: filter_<3, 13>(weight_out, out, im, ref, w, h, accurate); break;
-    case 1014: filter_<1, 14>(weight_out, out, im, ref, w, h, accurate); break;
-    case 2014: filter_<2, 14>(weight_out, out, im, ref, w, h, accurate); break;
-    case 3014: filter_<3, 14>(weight_out, out, im, ref, w, h, accurate); break;
-    case 1015: filter_<1, 15>(weight_out, out, im, ref, w, h, accurate); break;
-    case 2015: filter_<2, 15>(weight_out, out, im, ref, w, h, accurate); break;
-    case 3015: filter_<3, 15>(weight_out, out, im, ref, w, h, accurate); break;
-    case 1016: filter_<1, 16>(weight_out, out, im, ref, w, h, accurate); break;
-    case 2016: filter_<2, 16>(weight_out, out, im, ref, w, h, accurate); break;
-    case 3016: filter_<3, 16>(weight_out, out, im, ref, w, h, accurate); break;
-    default:
-	printf("Unsupported channel counts. Reference image must have 1 to 16 channels, input image must have 1 to 3 channels\n");	    
-    }    
-}
+    const int capacity = n * (PD + 1);
+    cudaMemset(h_values_dev, 0, capacity * (VD + 1) * sizeof(float));
+    cudaMemset(h_entries_dev, -1, capacity * 2 * sizeof(int));
+    cudaMemset(h_keys_dev, 0, capacity * PD * sizeof(signed short));
 
-std::vector<torch::Tensor> pfilter(torch::Tensor feature, torch::Tensor values){
-    int h = feature.size(0);
-    assert(h == values.size(0));
-    int w = feature.size(1);
-    assert(w == values.size(1));
-    int pd = feature.size(2);
-    int vd = values.size(2);
-    torch::Tensor out = torch::clone(values);
-    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA).requires_grad(false);
-    torch::Tensor weight_out = torch::zeros({h, w, 1}, options);
-    filter(
-        weight_out.data<float>(),
-        out.data<float>(),
-        values.data<float>(),
-        feature.data<float>(),
-        pd, vd, w, h, false
-    );
-    return {weight_out, out};    
-}
+    unsigned int cap_u = (unsigned int)capacity;
+    cudaMemcpyToSymbol(table_capacity, &cap_u, sizeof(unsigned int));
+    cudaMemcpyToSymbol(table_values,   &h_values_dev,  sizeof(float*));
+    cudaMemcpyToSymbol(table_entries,  &h_entries_dev, sizeof(int*));
+    cudaMemcpyToSymbol(table_keys,     &h_keys_dev,    sizeof(signed short*));
 
-template<int vd, int pd>
-void grad_(float * weight_in, float * out, float *im, float *ref, int w, int h, bool accurate) {    
-    int n = w*h;
-    float blurVariance = accurate ? 0.5 : 0;
+    setup_lattice_constants<PD>(capacity);
 
-    MirroredArray<float> scaleFactor(pd);
-    //MirroredArray<float> offset(pd);
-    for (int i = 0; i < pd; i++) {
-	scaleFactor.host[i] = (pd+1)*sqrtf((1.0/6 + blurVariance)/((i+1)*(i+2)));
-	//offset.host[i] = ((double)rand()/RAND_MAX)*(pd+1)*2;
-    }
-    scaleFactor.hostToDevice();
-    //offset.hostToDevice();
-
-    // MirroredArrayDevice<float> values(im, n*vd);
-    float * values = out;
-    MirroredArrayDevice<float> positions(ref, n*pd);
-    MirroredArray<MatrixEntry> matrix(n*(pd+1));
-    createHashTable<pd, vd+1>(n*(pd+1));
-
-    // Populate constant memory for hash helpers
-    unsigned long long int __host_two32 = ((unsigned long long int)1)<<32;
-    unsigned int __host_div_c = 2*(n*(pd+1));
-    unsigned int __host_div_l = ceilf(logf((float)__host_div_c) / logf(2.0f));
-    unsigned int __host_div_m = (__host_two32<<__host_div_l)/__host_div_c - __host_two32 + 1;
-    auto err = cudaMemcpyToSymbol(__div_c, &__host_div_c, sizeof(unsigned int));
-    if(err != cudaSuccess) printf("Copy Err %s", cudaGetErrorString(err));
-    cudaMemcpyToSymbol(__div_l, &__host_div_l, sizeof(unsigned int));
-    cudaMemcpyToSymbol(__div_m, &__host_div_m, sizeof(unsigned int));
-
-    // Populate constant memory with hash of offset vectors
-    unsigned int hOffset_host[pd+1];
-    signed short offset[pd+1];
-    for (int i = 0; i < pd; offset[i] = 1, i++);
-    for (int i = 0; i <= pd; i++) {
-      offset[i] -= pd+1; hOffset_host[i] = hash<pd>(offset); offset[i] += pd+1;
-    }
-    cudaMemcpyToSymbol((char*)&hOffset, &hOffset_host, sizeof(unsigned int)*(pd+1));
-
-    //  cudaGetLastError();
-    
-
-    dim3 blocks((w-1)/8+1, (h-1)/8+1, 1);
+    dim3 blocks((w - 1) / 8 + 1, (h - 1) / 8 + 1, 1);
     dim3 blockSize(8, 8, 1);
 
-    // timeval t[7];
+    createMatrix<PD, VD><<<blocks, blockSize>>>(w, h, features, matrix_dev);
 
-    // gettimeofday(t+0, NULL);    
-
-    createMatrix<pd><<<blocks, blockSize>>>(w, h, positions.device, 
-					    values, 
-					    scaleFactor.device,
-					    matrix.device);
-
-
-    // gettimeofday(t+1, NULL);    
-
-    //HashTable hostTable;
-    //int hashTableEntries;
-    //CUDA_SAFE_CALL(cudaMemcpy(&hostTable, table, sizeof(HashTable), cudaMemcpyDeviceToHost));
-    //CUDA_SAFE_CALL(cudaMemcpy(&hashTableEntries, hostTable_filled, sizeof(int), cudaMemcpyDeviceToHost));
-    //printf("Hash table has %d entries\n", hashTableEntries);   
-
-    // fix duplicate hash table entries
     int cleanBlockSize = 32;
-    dim3 cleanBlocks((n-1)/cleanBlockSize+1, 2*(pd+1), 1);
-    cleanHashTable<pd><<<cleanBlocks, cleanBlockSize>>>(2*n*(pd+1), matrix.device);
+    dim3 cleanBlocks((n - 1) / cleanBlockSize + 1, 2 * (PD + 1), 1);
+    cleanHashTable<PD><<<cleanBlocks, cleanBlockSize>>>(2 * n * (PD + 1), matrix_dev);
 
-    // gettimeofday(t+2, NULL);    
+    dim3 splatBlocks = blocks;
+    splatBlocks.y *= (PD + 1);
+    g_splatCache<PD, VD><<<splatBlocks, blockSize>>>(w, h, grad_values, matrix_dev, weight_in);
 
-    // splat splits by color, so extend the y coordinate to our blocks to represent that
-    blocks.y *= pd+1;
-    g_splatCache<pd, vd><<<blocks, blockSize>>>(w, h, values, matrix.device, weight_in);
-    //splat<pd, vd><<<blocks, blockSize>>>(w, h, values.device, matrix.device);
+    const int n_vertices = n * (PD + 1);
+    precomputeBlurNeighbors<PD><<<cleanBlocks, cleanBlockSize>>>(
+        n_vertices, matrix_dev, blur_neighbors_dev);
 
-    // gettimeofday(t+3, NULL);    
-
-    
-    if (accurate) {
-	float *newValues;
-	allocateCudaMemory((void**)&(newValues), n*(pd+1)*(vd+1)*sizeof(float));
-	cudaMemset((void *)newValues, 0, n*(pd+1)*(vd+1)*sizeof(float));
-	
-	for (int color = pd; color >= 0; color--) {	
-	    blur<pd, vd><<<cleanBlocks, cleanBlockSize>>>(n*(pd+1), newValues, matrix.device, color);
-	    // CUT_CHECK_ERROR("blur failed\n");
-	    newValues = swapHashTableValues(newValues);
-	}
+    float* current_values_dev = h_values_dev;
+    float* next_values_dev = blur_values_dev;
+    for (int color = PD; color >= 0; color--) {
+        blur<PD, VD><<<cleanBlocks, cleanBlockSize>>>(
+            n_vertices, next_values_dev, matrix_dev, blur_neighbors_dev, color);
+        cudaMemcpyToSymbol(table_values, &next_values_dev, sizeof(float*));
+        float* previous_values_dev = current_values_dev;
+        current_values_dev = next_values_dev;
+        next_values_dev = previous_values_dev;
     }
-    
 
-    // gettimeofday(t+4, NULL);    
-    
-    blocks.y /= (pd+1);
-    g_slice<pd, vd><<<blocks, blockSize>>>(w, h, values, matrix.device);
-	
-
-    // gettimeofday(t+5, NULL);    
-
-    // double total = (t[5].tv_sec - t[0].tv_sec)*1000.0 + (t[5].tv_usec - t[0].tv_usec)/1000.0;
-    // printf("Total time: %3.3f ms\n", total);
-
-    // char *names[5] = {"Create",
-	// 	      "Clean ",
-	// 	      "Splat ",
-	// 	      "Blur  ",
-	// 	      "Slice "};
-
-    // for (int i = 1; i < 6; i++) {
-	// printf("%s: %3.3f ms\n", names[i-1], (t[i].tv_sec - t[i-1].tv_sec)*1000.0 + (t[i].tv_usec - t[i-1].tv_usec)/1000.0);
-    // }
-    // printf("Total GPU memory usage: %u bytes\n", (unsigned int)GPU_MEMORY_ALLOCATION);
-    // auto err = cudaMemcpy(out, values.device, n*vd*sizeof(float), cudaMemcpyDeviceToDevice);
-    // if(err != cudaSuccess) printf("Copy Err %s", cudaGetErrorString(err));
-    destroyHashTable();
+    g_slice<PD, VD><<<blocks, blockSize>>>(w, h, out, matrix_dev);
 }
 
+#define DISPATCH_VD(PD_VALUE) \
+    switch (vd) { \
+        case 1: permuto_filter_impl<PD_VALUE, 1>(weight_out, out, values, features, matrix_storage, h_values_dev, blur_values_dev, h_entries_dev, h_keys_dev, blur_neighbors_dev, w, h); return; \
+        case 2: permuto_filter_impl<PD_VALUE, 2>(weight_out, out, values, features, matrix_storage, h_values_dev, blur_values_dev, h_entries_dev, h_keys_dev, blur_neighbors_dev, w, h); return; \
+        case 3: permuto_filter_impl<PD_VALUE, 3>(weight_out, out, values, features, matrix_storage, h_values_dev, blur_values_dev, h_entries_dev, h_keys_dev, blur_neighbors_dev, w, h); return; \
+        case 4: permuto_filter_impl<PD_VALUE, 4>(weight_out, out, values, features, matrix_storage, h_values_dev, blur_values_dev, h_entries_dev, h_keys_dev, blur_neighbors_dev, w, h); return; \
+        case 5: permuto_filter_impl<PD_VALUE, 5>(weight_out, out, values, features, matrix_storage, h_values_dev, blur_values_dev, h_entries_dev, h_keys_dev, blur_neighbors_dev, w, h); return; \
+        case 6: permuto_filter_impl<PD_VALUE, 6>(weight_out, out, values, features, matrix_storage, h_values_dev, blur_values_dev, h_entries_dev, h_keys_dev, blur_neighbors_dev, w, h); return; \
+        case 7: permuto_filter_impl<PD_VALUE, 7>(weight_out, out, values, features, matrix_storage, h_values_dev, blur_values_dev, h_entries_dev, h_keys_dev, blur_neighbors_dev, w, h); return; \
+        case 8: permuto_filter_impl<PD_VALUE, 8>(weight_out, out, values, features, matrix_storage, h_values_dev, blur_values_dev, h_entries_dev, h_keys_dev, blur_neighbors_dev, w, h); return; \
+        default: return; \
+    }
 
+#define DISPATCH_VD_GRAD(PD_VALUE) \
+    switch (vd) { \
+        case 1: permuto_filter_grad_impl<PD_VALUE, 1>(out, grad_values, weight_in, features, matrix_storage, h_values_dev, blur_values_dev, h_entries_dev, h_keys_dev, blur_neighbors_dev, w, h); return; \
+        case 2: permuto_filter_grad_impl<PD_VALUE, 2>(out, grad_values, weight_in, features, matrix_storage, h_values_dev, blur_values_dev, h_entries_dev, h_keys_dev, blur_neighbors_dev, w, h); return; \
+        case 3: permuto_filter_grad_impl<PD_VALUE, 3>(out, grad_values, weight_in, features, matrix_storage, h_values_dev, blur_values_dev, h_entries_dev, h_keys_dev, blur_neighbors_dev, w, h); return; \
+        case 4: permuto_filter_grad_impl<PD_VALUE, 4>(out, grad_values, weight_in, features, matrix_storage, h_values_dev, blur_values_dev, h_entries_dev, h_keys_dev, blur_neighbors_dev, w, h); return; \
+        case 5: permuto_filter_grad_impl<PD_VALUE, 5>(out, grad_values, weight_in, features, matrix_storage, h_values_dev, blur_values_dev, h_entries_dev, h_keys_dev, blur_neighbors_dev, w, h); return; \
+        case 6: permuto_filter_grad_impl<PD_VALUE, 6>(out, grad_values, weight_in, features, matrix_storage, h_values_dev, blur_values_dev, h_entries_dev, h_keys_dev, blur_neighbors_dev, w, h); return; \
+        case 7: permuto_filter_grad_impl<PD_VALUE, 7>(out, grad_values, weight_in, features, matrix_storage, h_values_dev, blur_values_dev, h_entries_dev, h_keys_dev, blur_neighbors_dev, w, h); return; \
+        case 8: permuto_filter_grad_impl<PD_VALUE, 8>(out, grad_values, weight_in, features, matrix_storage, h_values_dev, blur_values_dev, h_entries_dev, h_keys_dev, blur_neighbors_dev, w, h); return; \
+        default: return; \
+    }
 
-void grad(float * weight_in, float * out, float *im, float *ref, int pd, int vd, int w, int h, bool accurate) {
-    switch (vd*1000 + pd) {
-    case 1001: grad_<1, 1>(weight_in, out, im, ref, w, h, accurate); break;
-    case 2001: grad_<2, 1>(weight_in, out, im, ref, w, h, accurate); break;
-    case 3001: grad_<3, 1>(weight_in, out, im, ref, w, h, accurate); break;
-    case 1002: grad_<1, 2>(weight_in, out, im, ref, w, h, accurate); break;
-    case 2002: grad_<2, 2>(weight_in, out, im, ref, w, h, accurate); break;
-    case 3002: grad_<3, 2>(weight_in, out, im, ref, w, h, accurate); break;
-    case 1003: grad_<1, 3>(weight_in, out, im, ref, w, h, accurate); break;
-    case 2003: grad_<2, 3>(weight_in, out, im, ref, w, h, accurate); break;
-    case 3003: grad_<3, 3>(weight_in, out, im, ref, w, h, accurate); break;
-    case 1004: grad_<1, 4>(weight_in, out, im, ref, w, h, accurate); break;
-    case 2004: grad_<2, 4>(weight_in, out, im, ref, w, h, accurate); break;
-    case 3004: grad_<3, 4>(weight_in, out, im, ref, w, h, accurate); break;
-    case 1005: grad_<1, 5>(weight_in, out, im, ref, w, h, accurate); break;
-    case 2005: grad_<2, 5>(weight_in, out, im, ref, w, h, accurate); break;
-    case 3005: grad_<3, 5>(weight_in, out, im, ref, w, h, accurate); break;
-    case 1006: grad_<1, 6>(weight_in, out, im, ref, w, h, accurate); break;
-    case 2006: grad_<2, 6>(weight_in, out, im, ref, w, h, accurate); break;
-    case 3006: grad_<3, 6>(weight_in, out, im, ref, w, h, accurate); break;
-    case 1007: grad_<1, 7>(weight_in, out, im, ref, w, h, accurate); break;
-    case 2007: grad_<2, 7>(weight_in, out, im, ref, w, h, accurate); break;
-    case 3007: grad_<3, 7>(weight_in, out, im, ref, w, h, accurate); break;
-    case 1008: grad_<1, 8>(weight_in, out, im, ref, w, h, accurate); break;
-    case 2008: grad_<2, 8>(weight_in, out, im, ref, w, h, accurate); break;
-    case 3008: grad_<3, 8>(weight_in, out, im, ref, w, h, accurate); break;
-    case 1009: grad_<1, 9>(weight_in, out, im, ref, w, h, accurate); break;
-    case 2009: grad_<2, 9>(weight_in, out, im, ref, w, h, accurate); break;
-    case 3009: grad_<3, 9>(weight_in, out, im, ref, w, h, accurate); break;
-    case 1010: grad_<1, 10>(weight_in, out, im, ref, w, h, accurate); break;
-    case 2010: grad_<2, 10>(weight_in, out, im, ref, w, h, accurate); break;
-    case 3010: grad_<3, 10>(weight_in, out, im, ref, w, h, accurate); break;
-    case 1011: grad_<1, 11>(weight_in, out, im, ref, w, h, accurate); break;
-    case 2011: grad_<2, 11>(weight_in, out, im, ref, w, h, accurate); break;
-    case 3011: grad_<3, 11>(weight_in, out, im, ref, w, h, accurate); break;
-    case 1012: grad_<1, 12>(weight_in, out, im, ref, w, h, accurate); break;
-    case 2012: grad_<2, 12>(weight_in, out, im, ref, w, h, accurate); break;
-    case 3012: grad_<3, 12>(weight_in, out, im, ref, w, h, accurate); break;
-    case 1013: grad_<1, 13>(weight_in, out, im, ref, w, h, accurate); break;
-    case 2013: grad_<2, 13>(weight_in, out, im, ref, w, h, accurate); break;
-    case 3013: grad_<3, 13>(weight_in, out, im, ref, w, h, accurate); break;
-    case 1014: grad_<1, 14>(weight_in, out, im, ref, w, h, accurate); break;
-    case 2014: grad_<2, 14>(weight_in, out, im, ref, w, h, accurate); break;
-    case 3014: grad_<3, 14>(weight_in, out, im, ref, w, h, accurate); break;
-    case 1015: grad_<1, 15>(weight_in, out, im, ref, w, h, accurate); break;
-    case 2015: grad_<2, 15>(weight_in, out, im, ref, w, h, accurate); break;
-    case 3015: grad_<3, 15>(weight_in, out, im, ref, w, h, accurate); break;
-    case 1016: grad_<1, 16>(weight_in, out, im, ref, w, h, accurate); break;
-    case 2016: grad_<2, 16>(weight_in, out, im, ref, w, h, accurate); break;
-    case 3016: grad_<3, 16>(weight_in, out, im, ref, w, h, accurate); break;
-    default:
-	printf("Unsupported channel counts. Reference image must have 1 to 16 channels, input image must have 1 to 3 channels\n");	    
-    }    
+void permuto_filter(float* weight_out, float* out,
+                    const float* values,
+                    const float* features,
+                    void* matrix_storage,
+                    float* h_values_dev,
+                    float* blur_values_dev,
+                    int* h_entries_dev,
+                    signed short* h_keys_dev,
+                    int* blur_neighbors_dev,
+                    int pd, int vd, int w, int h)
+{
+    switch (pd) {
+        case 1: DISPATCH_VD(1)
+        case 2: DISPATCH_VD(2)
+        case 3: DISPATCH_VD(3)
+        case 4: DISPATCH_VD(4)
+        case 5: DISPATCH_VD(5)
+        case 6: DISPATCH_VD(6)
+        case 7: DISPATCH_VD(7)
+        case 8: DISPATCH_VD(8)
+        case 9: DISPATCH_VD(9)
+        case 10: DISPATCH_VD(10)
+        case 11: DISPATCH_VD(11)
+        case 12: DISPATCH_VD(12)
+        case 13: DISPATCH_VD(13)
+        case 14: DISPATCH_VD(14)
+        case 15: DISPATCH_VD(15)
+        case 16: DISPATCH_VD(16)
+        default: return;
+    }
 }
 
-
-torch::Tensor pfilter_grad(torch::Tensor feature, torch::Tensor g_values, torch::Tensor weight_saved){
-    int h = feature.size(0);
-    assert(h == g_values.size(0));
-    int w = feature.size(1);
-    assert(w == g_values.size(1));
-    int pd = feature.size(2);
-    int vd = g_values.size(2);
-    torch::Tensor out = torch::clone(g_values);
-    
-
-    grad(
-        weight_saved.data<float>(),
-        out.data<float>(),
-        g_values.data<float>(),
-        feature.data<float>(),
-        pd, vd, w, h, false
-    );
-    return out; 
+void permuto_filter_grad(float* out,
+                         const float* grad_values,
+                         const float* weight_in,
+                         const float* features,
+                         void* matrix_storage,
+                         float* h_values_dev,
+                         float* blur_values_dev,
+                         int* h_entries_dev,
+                         signed short* h_keys_dev,
+                         int* blur_neighbors_dev,
+                         int pd, int vd, int w, int h)
+{
+    switch (pd) {
+        case 1: DISPATCH_VD_GRAD(1)
+        case 2: DISPATCH_VD_GRAD(2)
+        case 3: DISPATCH_VD_GRAD(3)
+        case 4: DISPATCH_VD_GRAD(4)
+        case 5: DISPATCH_VD_GRAD(5)
+        case 6: DISPATCH_VD_GRAD(6)
+        case 7: DISPATCH_VD_GRAD(7)
+        case 8: DISPATCH_VD_GRAD(8)
+        case 9: DISPATCH_VD_GRAD(9)
+        case 10: DISPATCH_VD_GRAD(10)
+        case 11: DISPATCH_VD_GRAD(11)
+        case 12: DISPATCH_VD_GRAD(12)
+        case 13: DISPATCH_VD_GRAD(13)
+        case 14: DISPATCH_VD_GRAD(14)
+        case 15: DISPATCH_VD_GRAD(15)
+        case 16: DISPATCH_VD_GRAD(16)
+        default: return;
+    }
 }
-
-
