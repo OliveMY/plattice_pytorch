@@ -99,3 +99,23 @@ The input tensors must be contiguous CUDA `float32` tensors:
 
 - `feature`: `[H, W, pd]`, with `1 <= pd <= 16`
 - `values`: `[H, W, vd]`, with `1 <= vd <= 8`
+
+### Tests
+
+The repository includes a deterministic RGB test image at
+`tests/assets/test_image.png` and simple CUDA tests in `tests/test_plattice.py`.
+The tests JIT-build the extension, then check:
+
+- forward output shape and finite values
+- backward output shape and finite values
+- runtime `pd`/`vd` dispatch
+- bilateral filtering sanity against a brute-force CPU reference on a small crop
+
+Run them with:
+
+```bash
+python -m unittest tests.test_plattice
+```
+
+The tests require a CUDA-capable GPU and a PyTorch/CUDA toolchain with matching
+CUDA versions.
